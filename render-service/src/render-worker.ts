@@ -38,7 +38,7 @@ export async function executeRender(params: RenderParams): Promise<void> {
     job.progress = 0;
 
     console.log(
-      `[render-worker] Starting render ${renderId} (job=${jobId}, clip=${clipIndex})`
+      `[render-worker] Starting render ${renderId} (job=${jobId}, clip=${clipIndex})`,
     );
 
     const bundleLocation = getBundleLocation();
@@ -89,7 +89,9 @@ export async function executeRender(params: RenderParams): Promise<void> {
     job.progress = 100;
     job.outputUrl = outputLocation;
 
-    console.log(`[render-worker] Render ${renderId} completed: ${outputLocation}`);
+    console.log(
+      `[render-worker] Render ${renderId} completed: ${outputLocation}`,
+    );
   } catch (err) {
     job.status = "error";
     job.error = err instanceof Error ? err.message : String(err);
