@@ -922,6 +922,13 @@ def _resume_interrupted_jobs() -> set:
             # Finished after all — recovered as completed already.
             _clear_resume_manifest(job_id)
             continue
+        if os.path.isfile(os.path.join(job_path, ".guarded-gemini")):
+            # Receipt keys are intentionally never persisted. An interrupted
+            # guarded request therefore cannot safely resume or repeat an
+            # inference call; leave reconciliation to the controller.
+            print(f"🛑 Guarded Gemini job {job_id} interrupted; refusing automatic resume.")
+            _clear_resume_manifest(job_id)
+            continue
         try:
             with open(manifest_path) as f:
                 m = json.load(f)
@@ -1966,7 +1973,21 @@ async def run_job(job_id, job_data):
                     if missing:
                         jobs[job_id]['logs'].append(
                             f"⚠️ {missing} of {len(clips)} clips failed to render.")
-                    jobs[job_id]['result'] = {'clips': rendered, 'cost_analysis': cost_analysis}
+                    result = {'clips': rendered, 'cost_analysis': cost_analysis}
+                    if env.get("GUARDED_GEMINI_LIMITS_JSON"):
+                        receipt_path = env.get("GUARDED_GEMINI_RECEIPT_PATH")
+                        try:
+                            with open(receipt_path, "r", encoding="utf-8") as receipt_file:
+                                receipt = json.load(receipt_file)
+                            if receipt.get("in_flight") or receipt.get("calls_reserved") != receipt.get("calls_completed"):
+                                raise ValueError("ambiguous Gemini call")
+                            result["gemini_usage_receipt"] = receipt
+                        except Exception as exc:
+                            jobs[job_id]['status'] = 'failed'
+                            jobs[job_id]['logs'].append(
+                                f"Guarded Gemini receipt unavailable: {type(exc).__name__}")
+                            return
+                    jobs[job_id]['result'] = result
             else:
                  jobs[job_id]['status'] = 'failed'
                  jobs[job_id]['logs'].append("No metadata file generated.")
@@ -2350,6 +2371,7 @@ async def process_endpoint(
     thumbnail_session_id: Optional[str] = Form(None),
     captions: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None),
+    gemini_guard: Optional[str] = Form(None),
 ):
     model_env = _model_env_overrides(request)
     api_key = await resolve_gemini(request)
@@ -2385,6 +2407,7 @@ async def process_endpoint(
         thumbnail_session_id = body.get("thumbnail_session_id")
         captions = body.get("captions")
         upload_id = body.get("upload_id")
+        gemini_guard = body.get("gemini_guard")
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -2497,6 +2520,29 @@ async def process_endpoint(
     # still dies before it renders anything -- the server starts and every job
     # fails instead. setdefault, so an explicit PYTHONIOENCODING still wins.
     env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    # Controller-authorized jobs opt into a strict, versioned inference
+    # contract. Legacy requests omit this field and retain existing behavior.
+    if gemini_guard is not None:
+        import gemini_limits
+        try:
+            parsed_guard = json.loads(gemini_guard) if isinstance(gemini_guard, str) else gemini_guard
+            if parsed_guard != gemini_limits.REQUIRED:
+                raise ValueError("limits do not match the guarded contract")
+            receipt_key = request.headers.get("x-gemini-receipt-key", "")
+            if len(receipt_key) < 32:
+                raise ValueError("receipt key is missing")
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid Gemini guard: {exc}")
+        env["GUARDED_GEMINI_LIMITS_JSON"] = json.dumps(parsed_guard, sort_keys=True,
+            separators=(",", ":"))
+        env["GUARDED_GEMINI_RECEIPT_PATH"] = os.path.join(job_output_dir, "gemini_usage_receipt.json")
+        env["GUARDED_GEMINI_RECEIPT_KEY"] = receipt_key
+        # Optional model paths are forbidden, not merely discouraged.
+        env["AUTO_LAYOUT"] = "0"
+        env["SCREENCAST_LAYOUT"] = "0"
+        env["HOOK_GROUNDING"] = "0"
+        env["GUARDED_VISION_FAIL_CLOSED"] = "1"
 
     # Optional layouts are per job. The renderer reads these at import time in
     # the subprocess, so they must be set before Popen — same path WATERMARK
@@ -2673,6 +2719,9 @@ async def process_endpoint(
 
     # Resume manifest: enough to re-run this job if the container dies mid-flight
     # (a redeploy). No secrets — the env is rebuilt from os.environ on resume.
+    if env.get("GUARDED_GEMINI_LIMITS_JSON"):
+        with open(os.path.join(job_output_dir, ".guarded-gemini"), "w", encoding="utf-8") as marker:
+            marker.write("manual-reconciliation-required-after-interruption\n")
     _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id,
                            watermark=jobs[job_id]['watermark'],
                            webhook_url=webhook_url, webhook_secret=webhook_secret,

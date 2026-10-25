@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import gemini_limits
 from typing import Optional
 
 SCREEN_LAYOUTS = {"screencast", "wide", "inset"}
@@ -127,6 +128,8 @@ def _ask_gemini(frames, prompt, api_key):
     from google.genai import types as genai_types
     import gemini_worker
 
+    if gemini_limits.configured():
+        raise gemini_limits.GeminiLimitError("hook grounding is disabled for guarded jobs")
     client = genai.Client(api_key=api_key)
     model_name = os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
     parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg") for b in frames]

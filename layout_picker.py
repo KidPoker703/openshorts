@@ -43,6 +43,7 @@ by hand wins: this only ever ADDS, so an explicit choice is never overridden.
 """
 import json
 import os
+import gemini_limits
 
 # AUTO_LAYOUT=1 decides and applies. AUTO_LAYOUT=shadow decides, logs, and
 # applies NOTHING: the render is byte-for-byte what it would have been.
@@ -154,6 +155,8 @@ def pick(video_path, video_duration):
             print("   ⚠️ No readable frames — keeping the default layout.")
             return "none"
 
+        if gemini_limits.configured():
+            raise gemini_limits.GeminiLimitError("automatic layout is disabled for guarded jobs")
         client = genai.Client(api_key=api_key)
         parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
                  for b in frames]

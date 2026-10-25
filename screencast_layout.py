@@ -30,6 +30,7 @@ is a silent no-op, like every other optional Gemini path here.
 """
 import json
 import os
+import gemini_limits
 import time
 
 import numpy as np
@@ -172,6 +173,8 @@ def detect_content_ranges(video_path, video_duration):
     """
     if not ENABLED:
         return []
+    if gemini_limits.configured():
+        raise gemini_limits.GeminiLimitError("screencast Gemini analysis is disabled for guarded jobs")
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return []
