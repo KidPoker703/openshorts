@@ -99,6 +99,7 @@ def test_eight_small_calls_fit_profile_and_ninth_fails_closed(configured_guard):
     receipt = guard.receipt()
     assert receipt["calls_completed"] == 8
     assert receipt["reserved_input_tokens"] == guard.REQUIRED["max_total_input_tokens"]
+    assert receipt["reserved_output_tokens"] == 8 * 23
     assert receipt["transport_attempts"] == 8
     with pytest.raises(guard.GeminiLimitError, match="call limit"):
         guard.generate_content(client, model="gemini-3.1-flash-lite", contents="bounded",

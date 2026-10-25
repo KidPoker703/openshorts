@@ -239,6 +239,7 @@ def generate_content(client, *, model, contents, config, stage_id):
         receipt = _load()
         receipt["in_flight"] = False
         receipt["calls_completed"] += 1
+        receipt["reserved_output_tokens"] += output + thinking - allowance
         receipt["input_tokens"] += input_tokens
         receipt["cached_tokens"] += cached
         receipt["output_tokens"] += output
