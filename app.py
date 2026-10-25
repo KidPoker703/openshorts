@@ -2372,6 +2372,8 @@ async def process_endpoint(
     captions: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None),
     gemini_guard: Optional[str] = Form(None),
+    gemini_job_identity: Optional[str] = Form(None),
+    gemini_model: Optional[str] = Form(None),
 ):
     model_env = _model_env_overrides(request)
     api_key = await resolve_gemini(request)
@@ -2408,6 +2410,8 @@ async def process_endpoint(
         captions = body.get("captions")
         upload_id = body.get("upload_id")
         gemini_guard = body.get("gemini_guard")
+        gemini_job_identity = body.get("gemini_job_identity")
+        gemini_model = body.get("gemini_model")
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -2529,6 +2533,12 @@ async def process_endpoint(
             parsed_guard = json.loads(gemini_guard) if isinstance(gemini_guard, str) else gemini_guard
             if parsed_guard != gemini_limits.REQUIRED:
                 raise ValueError("limits do not match the guarded contract")
+            if (not isinstance(gemini_job_identity, str) or len(gemini_job_identity) != 64
+                    or any(char not in "0123456789abcdef" for char in gemini_job_identity)):
+                raise ValueError("job identity is invalid")
+            selected_model = env.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+            if gemini_model != selected_model:
+                raise ValueError("model does not match the selected job model")
             receipt_key = request.headers.get("x-gemini-receipt-key", "")
             if len(receipt_key) < 32:
                 raise ValueError("receipt key is missing")
@@ -2538,6 +2548,11 @@ async def process_endpoint(
             separators=(",", ":"))
         env["GUARDED_GEMINI_RECEIPT_PATH"] = os.path.join(job_output_dir, "gemini_usage_receipt.json")
         env["GUARDED_GEMINI_RECEIPT_KEY"] = receipt_key
+        env["GUARDED_GEMINI_JOB_IDENTITY"] = gemini_job_identity
+        env["GUARDED_GEMINI_ENGINE_JOB_ID"] = job_id
+        env["GUARDED_GEMINI_MODEL"] = gemini_model
+        if os.path.exists(env["GUARDED_GEMINI_RECEIPT_PATH"]):
+            raise HTTPException(status_code=409, detail="Guarded Gemini receipt already exists")
         # Optional model paths are forbidden, not merely discouraged.
         env["AUTO_LAYOUT"] = "0"
         env["SCREENCAST_LAYOUT"] = "0"

@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 CONTRACT_VERSION = "openshorts-guarded-gemini-v1"
@@ -46,7 +47,11 @@ def limits():
         raise GeminiLimitError("guarded Gemini limits are malformed") from exc
     if value != REQUIRED:
         raise GeminiLimitError("guarded Gemini limits do not match the enforced contract")
-    if not os.getenv("GUARDED_GEMINI_RECEIPT_PATH") or len(os.getenv("GUARDED_GEMINI_RECEIPT_KEY", "")) < 32:
+    if (not os.getenv("GUARDED_GEMINI_RECEIPT_PATH")
+            or len(os.getenv("GUARDED_GEMINI_RECEIPT_KEY", "")) < 32
+            or len(os.getenv("GUARDED_GEMINI_JOB_IDENTITY", "")) != 64
+            or not os.getenv("GUARDED_GEMINI_ENGINE_JOB_ID")
+            or not os.getenv("GUARDED_GEMINI_MODEL")):
         raise GeminiLimitError("guarded Gemini receipt configuration is incomplete")
     return value
 
@@ -59,7 +64,10 @@ def guarded_client(genai, types, api_key):
     options = types.HttpOptions(retry_options=None)
     client = genai.Client(api_key=api_key, http_options=options)
     actual = getattr(getattr(client, "_api_client", None), "_http_options", None)
-    if actual is None or getattr(actual, "retry_options", "missing") is not None:
+    retrying = getattr(getattr(client, "_api_client", None), "_retry", None)
+    max_attempts = getattr(getattr(retrying, "stop", None), "max_attempt_number", None)
+    if (actual is None or getattr(actual, "retry_options", "missing") is not None
+            or max_attempts != 1):
         raise GeminiLimitError("zero SDK retries cannot be proven")
     return client
 
@@ -76,10 +84,14 @@ def _sign(payload):
 
 def _initial():
     return {"contract_version": CONTRACT_VERSION, "limits": REQUIRED,
+            "job_identity": os.environ["GUARDED_GEMINI_JOB_IDENTITY"],
+            "engine_job_id": os.environ["GUARDED_GEMINI_ENGINE_JOB_ID"],
+            "expected_model": os.environ["GUARDED_GEMINI_MODEL"],
+            "sdk_transport_attempts_max": 1, "optional_inference_used": [],
             "calls_reserved": 0, "calls_completed": 0,
             "input_tokens": 0, "cached_tokens": 0,
             "output_tokens": 0, "thinking_tokens": 0,
-            "reserved_output_tokens": 0, "in_flight": False,
+            "reserved_output_tokens": 0, "reserved_input_tokens": 0, "in_flight": False,
             "stages": [], "status": "active"}
 
 
@@ -93,6 +105,10 @@ def _load():
         raise GeminiLimitError("Gemini receipt integrity failed")
     if value.get("contract_version") != CONTRACT_VERSION or value.get("limits") != REQUIRED:
         raise GeminiLimitError("Gemini receipt contract changed")
+    if (value.get("job_identity") != os.environ["GUARDED_GEMINI_JOB_IDENTITY"]
+            or value.get("engine_job_id") != os.environ["GUARDED_GEMINI_ENGINE_JOB_ID"]
+            or value.get("expected_model") != os.environ["GUARDED_GEMINI_MODEL"]):
+        raise GeminiLimitError("Gemini receipt job identity changed")
     return value
 
 
@@ -106,36 +122,51 @@ def _save(value):
     os.replace(temporary, path)
 
 
-def _input_upper_bound(contents):
-    """Conservative byte bound: every text token consumes at least one byte.
+@contextmanager
+def _exclusive():
+    """Cross-process fail-closed lock; stale locks require manual reconciliation."""
+    lock_path = _path().with_suffix(_path().suffix + ".lock")
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise GeminiLimitError("Gemini receipt is locked or a prior writer crashed") from exc
+    try:
+        os.write(descriptor, f"pid={os.getpid()}\n".encode())
+        os.fsync(descriptor)
+        yield
+    finally:
+        os.close(descriptor)
+        try: lock_path.unlink()
+        except FileNotFoundError: pass
 
-    Guarded jobs disable all multimodal paths, so bytes/Parts are prohibited.
-    """
+
+def _require_text(contents):
+    """Guarded jobs reject every multimodal/structured input path."""
     def visit(value):
         if isinstance(value, str): return len(value.encode("utf-8"))
         if isinstance(value, (list, tuple)): return sum(visit(item) for item in value)
-        if isinstance(value, dict): return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
         raise GeminiLimitError("guarded Gemini input must be text-only")
-    return visit(contents)
+    visit(contents)
 
 
-def generate_content(client, *, model, contents, config, stage):
+def generate_content(client, *, model, contents, config, stage_id):
     """Reserve limits, make exactly one SDK call, and persist verified usage."""
     if not configured():
         return client.models.generate_content(model=model, contents=contents, config=config)
     cap = limits()
-    upper = _input_upper_bound(contents)
-    if upper > cap["max_input_tokens_per_call"]:
-        raise GeminiLimitError("Gemini per-call input limit exceeded")
-    with _lock:
+    _require_text(contents)
+    if model != os.environ["GUARDED_GEMINI_MODEL"]:
+        raise GeminiLimitError("Gemini model differs from the guarded job identity")
+    reservation = cap["max_input_tokens_per_call"]
+    with _lock, _exclusive():
         receipt = _load()
         if receipt["in_flight"]:
             raise GeminiLimitError("prior Gemini call outcome is ambiguous")
         if receipt["calls_reserved"] >= cap["max_calls"]:
             raise GeminiLimitError("Gemini call limit exhausted")
-        if any(item.get("stage") == stage for item in receipt["stages"]):
+        if any(item.get("stage_id") == stage_id for item in receipt["stages"]):
             raise GeminiLimitError("Gemini stage attempt already consumed")
-        if receipt["input_tokens"] + upper > cap["max_total_input_tokens"]:
+        if receipt["reserved_input_tokens"] + reservation > cap["max_total_input_tokens"]:
             raise GeminiLimitError("Gemini total input limit exhausted")
         remaining = cap["max_total_output_tokens"] - receipt["reserved_output_tokens"]
         allowance = min(cap["max_output_tokens_per_call"], remaining)
@@ -145,10 +176,11 @@ def generate_content(client, *, model, contents, config, stage):
             raise GeminiLimitError("Gemini output limit cannot be applied")
         config = config.model_copy(update={"max_output_tokens": allowance})
         receipt["calls_reserved"] += 1
+        receipt["reserved_input_tokens"] += reservation
         receipt["reserved_output_tokens"] += allowance
         receipt["in_flight"] = True
-        receipt["stages"].append({"stage": stage, "model": model, "state": "outcome_unknown",
-                                  "input_upper_bound": upper,
+        receipt["stages"].append({"stage_id": stage_id, "model": model, "state": "outcome_unknown",
+                                  "input_tokens_reserved": reservation,
                                   "output_tokens_reserved": allowance})
         _save(receipt)
     response = client.models.generate_content(model=model, contents=contents, config=config)
@@ -160,11 +192,11 @@ def generate_content(client, *, model, contents, config, stage):
     cached = int(getattr(usage, "cached_content_token_count", 0) or 0)
     output = int(usage.candidates_token_count or 0)
     thinking = int(getattr(usage, "thoughts_token_count", 0) or 0)
-    if min(input_tokens, cached, output, thinking) < 0 or input_tokens + cached > upper:
+    if min(input_tokens, cached, output, thinking) < 0 or input_tokens + cached > reservation:
         raise GeminiLimitError("Gemini input usage exceeds its reservation")
     if output + thinking > allowance:
         raise GeminiLimitError("Gemini output usage exceeds its reservation")
-    with _lock:
+    with _lock, _exclusive():
         receipt = _load()
         receipt["in_flight"] = False
         receipt["calls_completed"] += 1
@@ -181,7 +213,8 @@ def generate_content(client, *, model, contents, config, stage):
 
 def receipt():
     if not configured(): return None
-    value = _load()
+    with _lock, _exclusive():
+        value = _load()
     if value["in_flight"] or value["calls_reserved"] != value["calls_completed"]:
         raise GeminiLimitError("Gemini receipt has an ambiguous call")
     payload = dict(value); payload["integrity_sha256"] = _sign(value)

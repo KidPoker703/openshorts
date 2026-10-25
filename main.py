@@ -1,4 +1,5 @@
 import time
+import hashlib
 import cv2
 import subprocess
 import argparse
@@ -1500,6 +1501,9 @@ def _run_gemini_stage(client, model_name, prompt, schema):
     shapes (connection refused while the model loads, a truncated body,
     a 5xx from a busy vLLM)."""
     use_local = llm_backend.active()
+    if gemini_limits.configured() and use_local:
+        raise gemini_limits.GeminiLimitError(
+            "guarded jobs reject the optional local LLM inference path")
     config = None if use_local else genai_types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=schema,
@@ -1510,7 +1514,8 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             if use_local:
                 return llm_backend.generate_json(prompt, schema, model=model_name)
             response = gemini_limits.generate_content(client, model=model_name,
-                contents=prompt, config=config, stage=f"clip-{schema.__name__}")
+                contents=prompt, config=config,
+                stage_id=f"clip-{schema.__name__}-{hashlib.sha256(prompt.encode('utf-8')).hexdigest()[:24]}")
             # Policy blocks are deterministic — retrying only burns quota and
             # time, and the user deserves the real reason instead of a generic
             # "empty response" (prod 23-jul: PROHIBITED_CONTENT on every try).
@@ -1566,6 +1571,9 @@ def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs
             costs.append(cost)
         return list(parsed.get(key) or [])
     except gemini_worker.GeminiBlockedError as e:
+        if gemini_limits.configured():
+            raise gemini_limits.GeminiLimitError(
+                "guarded jobs reject recursive policy-split inference") from e
         if len(items) == 1:
             print(f"   🚫 {label}: Gemini blocked window {items[0].get('id')} on its own; skipping it ({e})")
             return []

@@ -1,0 +1,25 @@
+name: guarded-gemini
+
+on:
+  pull_request:
+    paths:
+      - "gemini_limits.py"
+      - "main.py"
+      - "app.py"
+      - "layout_picker.py"
+      - "hook_grounding.py"
+      - "screencast_layout.py"
+      - "tests/test_gemini_limits.py"
+      - ".github/workflows/guarded-gemini.yml"
+
+jobs:
+  offline-limiter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install pytest google-genai==1.75.0
+      - run: python -m pytest tests/test_gemini_limits.py -q
+      - run: python -m py_compile gemini_limits.py app.py main.py layout_picker.py hook_grounding.py screencast_layout.py
