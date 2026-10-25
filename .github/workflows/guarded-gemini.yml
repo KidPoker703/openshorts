@@ -1,6 +1,9 @@
 name: guarded-gemini
 
 on:
+  push:
+    branches:
+      - issue-21-guarded-gemini-limiter
   pull_request:
     paths:
       - "gemini_limits.py"
