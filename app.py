@@ -2547,6 +2547,7 @@ async def process_endpoint(
         env["GUARDED_GEMINI_LIMITS_JSON"] = json.dumps(parsed_guard, sort_keys=True,
             separators=(",", ":"))
         env["GUARDED_GEMINI_RECEIPT_PATH"] = os.path.join(job_output_dir, "gemini_usage_receipt.json")
+        env["GUARDED_GEMINI_JOB_DIR"] = job_output_dir
         env["GUARDED_GEMINI_RECEIPT_KEY"] = receipt_key
         env["GUARDED_GEMINI_JOB_IDENTITY"] = gemini_job_identity
         env["GUARDED_GEMINI_ENGINE_JOB_ID"] = job_id

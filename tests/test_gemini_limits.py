@@ -17,6 +17,8 @@ class Models:
     def __init__(self): self.calls = []
     def generate_content(self, **kwargs):
         self.calls.append(kwargs)
+        with guard._transport_lock:
+            guard._transport_attempts += 1
         usage = SimpleNamespace(prompt_token_count=3, cached_content_token_count=2,
             candidates_token_count=20, thoughts_token_count=3)
         return SimpleNamespace(usage_metadata=usage)
@@ -26,6 +28,7 @@ class Models:
 def configured_guard(monkeypatch, tmp_path):
     monkeypatch.setenv("GUARDED_GEMINI_LIMITS_JSON", json.dumps(guard.REQUIRED))
     monkeypatch.setenv("GUARDED_GEMINI_RECEIPT_PATH", str(tmp_path / "receipt.json"))
+    monkeypatch.setenv("GUARDED_GEMINI_JOB_DIR", str(tmp_path))
     monkeypatch.setenv("GUARDED_GEMINI_RECEIPT_KEY", "s" * 64)
     monkeypatch.setenv("GUARDED_GEMINI_JOB_IDENTITY", "a" * 64)
     monkeypatch.setenv("GUARDED_GEMINI_ENGINE_JOB_ID", "engine-job-1")
@@ -43,7 +46,8 @@ def test_guard_enforces_output_cap_receipt_and_one_attempt_per_stage(configured_
     assert receipt["stages"][0]["model"] == "gemini-3.1-flash-lite"
     assert receipt["job_identity"] == "a" * 64
     assert receipt["reserved_input_tokens"] == guard.REQUIRED["max_input_tokens_per_call"]
-    assert receipt["cached_tokens"] == 2 and receipt["thinking_tokens"] == 3
+    assert receipt["input_tokens"] == 1 and receipt["cached_tokens"] == 2
+    assert receipt["thinking_tokens"] == 3 and receipt["transport_attempts"] == 1
     with pytest.raises(guard.GeminiLimitError, match="stage attempt"):
         guard.generate_content(client, model="gemini-3.1-flash-lite", contents="again",
                                config=Config(), stage_id="score-001")
@@ -51,7 +55,9 @@ def test_guard_enforces_output_cap_receipt_and_one_attempt_per_stage(configured_
 
 def test_ambiguous_call_is_durable_and_blocks_restart(configured_guard):
     class Failing:
-        def generate_content(self, **kwargs): raise TimeoutError("ambiguous")
+        def generate_content(self, **kwargs):
+            with guard._transport_lock: guard._transport_attempts += 1
+            raise TimeoutError("ambiguous")
     client = SimpleNamespace(models=Failing())
     with pytest.raises(TimeoutError):
         guard.generate_content(client, model="gemini-3.1-flash-lite", contents="x",
@@ -63,7 +69,8 @@ def test_ambiguous_call_is_durable_and_blocks_restart(configured_guard):
 
 def test_zero_sdk_retries_must_be_provable(configured_guard):
     class HttpOptions:
-        def __init__(self, retry_options): self.retry_options = retry_options
+        def __init__(self, retry_options, httpx_client):
+            self.retry_options = retry_options; self.httpx_client = httpx_client
     class Client:
         def __init__(self, **kwargs):
             assert kwargs["http_options"].retry_options is None
@@ -84,14 +91,18 @@ def test_missing_usage_multimodal_and_tampered_receipt_fail_closed(configured_gu
         guard.receipt()
 
 
-def test_total_input_reservations_exhaust_before_fifth_call(configured_guard):
+def test_eight_small_calls_fit_profile_and_ninth_fails_closed(configured_guard):
     client = SimpleNamespace(models=Models())
-    for index in range(4):
+    for index in range(8):
         guard.generate_content(client, model="gemini-3.1-flash-lite", contents="bounded",
             config=Config(), stage_id=f"stage-{index}")
-    with pytest.raises(guard.GeminiLimitError, match="total input"):
+    receipt = guard.receipt()
+    assert receipt["calls_completed"] == 8
+    assert receipt["reserved_input_tokens"] == guard.REQUIRED["max_total_input_tokens"]
+    assert receipt["transport_attempts"] == 8
+    with pytest.raises(guard.GeminiLimitError, match="call limit"):
         guard.generate_content(client, model="gemini-3.1-flash-lite", contents="bounded",
-            config=Config(), stage_id="stage-4")
+            config=Config(), stage_id="stage-8")
 
 
 def test_existing_interprocess_lock_fails_closed(configured_guard):
@@ -100,6 +111,21 @@ def test_existing_interprocess_lock_fails_closed(configured_guard):
         guard.generate_content(SimpleNamespace(models=Models()),
             model="gemini-3.1-flash-lite", contents="bounded",
             config=Config(), stage_id="score-001")
+
+
+def test_unobserved_transport_and_untrusted_receipt_directory_fail_closed(configured_guard,
+                                                                          monkeypatch,
+                                                                          tmp_path):
+    client = SimpleNamespace(models=SimpleNamespace(generate_content=lambda **kwargs:
+        SimpleNamespace(usage_metadata=SimpleNamespace(prompt_token_count=1,
+            cached_content_token_count=0, candidates_token_count=1, thoughts_token_count=0))))
+    with pytest.raises(guard.GeminiLimitError, match="exactly one"):
+        guard.generate_content(client, model="gemini-3.1-flash-lite", contents="bounded",
+            config=Config(), stage_id="score-unobserved")
+    outside = tmp_path / "outside"; outside.mkdir()
+    monkeypatch.setenv("GUARDED_GEMINI_RECEIPT_PATH", str(outside / "receipt.json"))
+    with pytest.raises(guard.GeminiLimitError, match="trusted job directory"):
+        guard.limits(); guard.receipt()
 
 
 def test_installed_sdk_sync_transport_makes_exactly_one_http_attempt(configured_guard):

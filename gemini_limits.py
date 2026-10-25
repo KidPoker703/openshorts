@@ -12,6 +12,8 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
+import httpx
+
 CONTRACT_VERSION = "openshorts-guarded-gemini-v1"
 REQUIRED = {
     "contract_version": CONTRACT_VERSION,
@@ -20,7 +22,7 @@ REQUIRED = {
     "sdk_retries": 0,
     "max_output_tokens_per_call": 2048,
     "max_total_output_tokens": 8192,
-    "max_input_tokens_per_call": 262144,
+    "max_input_tokens_per_call": 131072,
     "max_total_input_tokens": 1048576,
     "auto_layout": False,
     "screencast_gemini": False,
@@ -28,6 +30,8 @@ REQUIRED = {
     "vision_fallback": "fail_closed",
 }
 _lock = threading.RLock()
+_transport_lock = threading.Lock()
+_transport_attempts = 0
 
 
 class GeminiLimitError(RuntimeError):
@@ -51,7 +55,8 @@ def limits():
             or len(os.getenv("GUARDED_GEMINI_RECEIPT_KEY", "")) < 32
             or len(os.getenv("GUARDED_GEMINI_JOB_IDENTITY", "")) != 64
             or not os.getenv("GUARDED_GEMINI_ENGINE_JOB_ID")
-            or not os.getenv("GUARDED_GEMINI_MODEL")):
+            or not os.getenv("GUARDED_GEMINI_MODEL")
+            or not os.getenv("GUARDED_GEMINI_JOB_DIR")):
         raise GeminiLimitError("guarded Gemini receipt configuration is incomplete")
     return value
 
@@ -61,7 +66,15 @@ def guarded_client(genai, types, api_key):
     if not configured():
         return genai.Client(api_key=api_key)
     limits()
-    options = types.HttpOptions(retry_options=None)
+    global _transport_attempts
+    with _transport_lock:
+        _transport_attempts = 0
+    def observed_request(_request):
+        global _transport_attempts
+        with _transport_lock:
+            _transport_attempts += 1
+    transport = httpx.Client(event_hooks={"request": [observed_request]})
+    options = types.HttpOptions(retry_options=None, httpx_client=transport)
     client = genai.Client(api_key=api_key, http_options=options)
     actual = getattr(getattr(client, "_api_client", None), "_http_options", None)
     retrying = getattr(getattr(client, "_api_client", None), "_retry", None)
@@ -73,7 +86,11 @@ def guarded_client(genai, types, api_key):
 
 
 def _path():
-    return Path(os.environ["GUARDED_GEMINI_RECEIPT_PATH"])
+    path = Path(os.environ["GUARDED_GEMINI_RECEIPT_PATH"]).resolve()
+    job_dir = Path(os.environ["GUARDED_GEMINI_JOB_DIR"]).resolve(strict=True)
+    if path.parent != job_dir or job_dir.is_symlink():
+        raise GeminiLimitError("Gemini receipt path is outside the trusted job directory")
+    return path
 
 
 def _sign(payload):
@@ -87,7 +104,7 @@ def _initial():
             "job_identity": os.environ["GUARDED_GEMINI_JOB_IDENTITY"],
             "engine_job_id": os.environ["GUARDED_GEMINI_ENGINE_JOB_ID"],
             "expected_model": os.environ["GUARDED_GEMINI_MODEL"],
-            "sdk_transport_attempts_max": 1, "optional_inference_used": [],
+            "transport_attempts": 0, "optional_inference_used": [],
             "calls_reserved": 0, "calls_completed": 0,
             "input_tokens": 0, "cached_tokens": 0,
             "output_tokens": 0, "thinking_tokens": 0,
@@ -183,16 +200,38 @@ def generate_content(client, *, model, contents, config, stage_id):
                                   "input_tokens_reserved": reservation,
                                   "output_tokens_reserved": allowance})
         _save(receipt)
-    response = client.models.generate_content(model=model, contents=contents, config=config)
+    with _transport_lock:
+        before_attempts = _transport_attempts
+    try:
+        response = client.models.generate_content(model=model, contents=contents, config=config)
+    except Exception:
+        with _transport_lock:
+            observed = _transport_attempts - before_attempts
+        with _lock, _exclusive():
+            receipt = _load()
+            receipt["transport_attempts"] += observed
+            receipt["stages"][-1]["transport_attempts"] = observed
+            _save(receipt)
+        raise
+    with _transport_lock:
+        observed = _transport_attempts - before_attempts
+    if observed != 1:
+        with _lock, _exclusive():
+            receipt = _load()
+            receipt["transport_attempts"] += observed
+            receipt["stages"][-1]["transport_attempts"] = observed
+            _save(receipt)
+        raise GeminiLimitError("exactly one Gemini transport attempt was not observed")
     usage = getattr(response, "usage_metadata", None)
     required = ("prompt_token_count", "candidates_token_count")
     if usage is None or any(getattr(usage, name, None) is None for name in required):
         raise GeminiLimitError("Gemini usage metadata is missing")
-    input_tokens = int(usage.prompt_token_count or 0)
+    prompt_tokens = int(usage.prompt_token_count or 0)
     cached = int(getattr(usage, "cached_content_token_count", 0) or 0)
+    input_tokens = prompt_tokens - cached
     output = int(usage.candidates_token_count or 0)
     thinking = int(getattr(usage, "thoughts_token_count", 0) or 0)
-    if min(input_tokens, cached, output, thinking) < 0 or input_tokens + cached > reservation:
+    if min(input_tokens, cached, output, thinking) < 0 or prompt_tokens > reservation:
         raise GeminiLimitError("Gemini input usage exceeds its reservation")
     if output + thinking > allowance:
         raise GeminiLimitError("Gemini output usage exceeds its reservation")
@@ -204,8 +243,10 @@ def generate_content(client, *, model, contents, config, stage_id):
         receipt["cached_tokens"] += cached
         receipt["output_tokens"] += output
         receipt["thinking_tokens"] += thinking
+        receipt["transport_attempts"] += observed
         receipt["stages"][-1].update({"state": "completed", "input_tokens": input_tokens,
-            "cached_tokens": cached, "output_tokens": output, "thinking_tokens": thinking})
+            "cached_tokens": cached, "output_tokens": output, "thinking_tokens": thinking,
+            "transport_attempts": observed})
         receipt["status"] = "complete" if receipt["calls_completed"] == cap["max_calls"] else "active"
         _save(receipt)
     return response
